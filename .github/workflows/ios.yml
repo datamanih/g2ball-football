@@ -1,0 +1,76 @@
+# Builds the G2Ball iPhone app on a GitHub-hosted Mac.
+# Run it from the Actions tab: "iPhone app" → Run workflow.
+# - Always: builds the website code, syncs it into the iOS project and compiles for the simulator (no Apple account needed).
+# - With "upload" ticked: archives a signed App Store build and uploads it to App Store Connect / TestFlight.
+#   Needs these repository secrets (Settings → Secrets and variables → Actions):
+#     APPLE_TEAM_ID   your 10-character Team ID (developer.apple.com → Membership)
+#     ASC_KEY_ID      App Store Connect API key ID (Users and Access → Integrations → App Store Connect API, role Admin)
+#     ASC_ISSUER_ID   the Issuer ID shown on that page
+#     ASC_KEY_P8      the full text of the downloaded AuthKey_XXXX.p8 file
+name: iPhone app
+on:
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: Sign and upload to TestFlight
+        type: boolean
+        default: true
+      version:
+        description: Version number shown in the App Store
+        type: string
+        default: '1.1.1'
+jobs:
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash   # bash -eo pipefail, so a failed xcodebuild isn't hidden by | tail
+        working-directory: g2ball-web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: g2ball-web/package-lock.json
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - name: Build the app's web code
+        run: |
+          npm ci
+          APP_VERSION='${{ inputs.version }}' npx vite build
+          rm -rf dist/download
+          npx cap sync ios
+      - name: Compile check (simulator, unsigned)
+        run: |
+          xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO MARKETING_VERSION='${{ inputs.version }}' build | tail -n 40
+      - name: Archive and upload to TestFlight
+        if: ${{ inputs.upload }}
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          for v in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+            if [ -z "${!v}" ]; then echo "::error::Missing repository secret $v"; exit 1; fi
+          done
+          KEY="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          printf '%s\n' "$ASC_KEY_P8" > "$KEY"
+          AUTH=(-allowProvisioningUpdates -authenticationKeyPath "$KEY" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          BUILD=$(( ${{ github.run_number }} + 0 ))
+          xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic \
+            MARKETING_VERSION='${{ inputs.version }}' CURRENT_PROJECT_VERSION="$BUILD" \
+            "${AUTH[@]}" archive | tail -n 60
+          sed "s/__TEAM_ID__/$APPLE_TEAM_ID/" ios/App/ExportOptions.plist > "$RUNNER_TEMP/ExportOptions.plist"
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" \
+            "${AUTH[@]}" | tail -n 60
+          rm -f "$KEY"
+          echo "Uploaded version ${{ inputs.version }} build $BUILD. It appears in App Store Connect → TestFlight after Apple processes it (usually 10–30 minutes)." >> "$GITHUB_STEP_SUMMARY"
